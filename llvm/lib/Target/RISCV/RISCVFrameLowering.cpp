@@ -589,7 +589,8 @@ class CFIRestoreRegisterEmitter {
   MachineFunction &m_MF;
 
 public:
-  CFIRestoreRegisterEmitter(const RISCVFrameLowering &, MachineFunction &MF) : m_MF{MF} {};
+  CFIRestoreRegisterEmitter(const RISCVFrameLowering &, MachineFunction &MF)
+      : m_MF{MF} {};
 
   void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
             const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
@@ -606,30 +607,33 @@ public:
 class CFISaveRVVRegisterEmitter {
   MachineFunction &m_MF;
   MachineFrameInfo &m_MFI;
-	const uint64_t m_FixedSize;
+  const uint64_t m_FixedSize;
 
-	static uint64_t getFixedSize(const RISCVFrameLowering &FL, MachineFunction &MF, MachineFrameInfo &MFI) {
-  	const auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
-		
-		uint64_t FixedSize = FL.getStackSizeWithRVVPadding(MF);
-		if (!FL.hasFP(MF)) {
-			uint64_t ScalarLocalVarSize =
-					MFI.getStackSize() - RVFI->getCalleeSavedStackSize() -
-					RVFI->getRVPushStackSize() - RVFI->getVarArgsSaveSize() +
-					RVFI->getRVVPadding();
-			FixedSize -= ScalarLocalVarSize;
-		}
-		return FixedSize;
-	}
+  static uint64_t getFixedSize(const RISCVFrameLowering &FL,
+                               MachineFunction &MF, MachineFrameInfo &MFI) {
+    const auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+
+    uint64_t FixedSize = FL.getStackSizeWithRVVPadding(MF);
+    if (!FL.hasFP(MF)) {
+      uint64_t ScalarLocalVarSize =
+          MFI.getStackSize() - RVFI->getCalleeSavedStackSize() -
+          RVFI->getRVPushStackSize() - RVFI->getVarArgsSaveSize() +
+          RVFI->getRVVPadding();
+      FixedSize -= ScalarLocalVarSize;
+    }
+    return FixedSize;
+  }
 
 public:
-  CFISaveRVVRegisterEmitter(const RISCVFrameLowering &FL, MachineFunction &MF) : m_MF{MF}, m_MFI{MF.getFrameInfo()}, m_FixedSize{getFixedSize(FL, MF, m_MFI)} {};
+  CFISaveRVVRegisterEmitter(const RISCVFrameLowering &FL, MachineFunction &MF)
+      : m_MF{MF}, m_MFI{MF.getFrameInfo()},
+        m_FixedSize{getFixedSize(FL, MF, m_MFI)} {};
 
-void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
-					const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
-					const DebugLoc &DL, const CalleeSavedInfo &CS) const {
+  void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+            const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
+            const DebugLoc &DL, const CalleeSavedInfo &CS) const {
 
-  // Insert the spill to the stack frame.
+    // Insert the spill to the stack frame.
     int FI = CS.getFrameIdx();
     MCRegister BaseReg = getRVVBaseRegister(RI, CS.getReg());
     unsigned NumRegs = getCalleeSavedRVVNumRegs(CS.getReg());
@@ -647,11 +651,12 @@ class CFIRestoreRVVRegisterEmitter {
   MachineFunction &m_MF;
 
 public:
-  CFIRestoreRVVRegisterEmitter(const RISCVFrameLowering &, MachineFunction &MF) : m_MF{MF} {};
+  CFIRestoreRVVRegisterEmitter(const RISCVFrameLowering &, MachineFunction &MF)
+      : m_MF{MF} {};
 
-void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
-					const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
-					const DebugLoc &DL, const CalleeSavedInfo &CS) const {
+  void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+            const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
+            const DebugLoc &DL, const CalleeSavedInfo &CS) const {
     MCRegister BaseReg = getRVVBaseRegister(RI, CS.getReg());
     unsigned NumRegs = getCalleeSavedRVVNumRegs(CS.getReg());
     for (unsigned i = 0; i < NumRegs; ++i) {
@@ -779,7 +784,8 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
     // stack space. Align the stack size down to a multiple of 16. This is
     // needed for RVE.
     // FIXME: Can we increase the stack size to a multiple of 16 instead?
-    uint64_t Spimm = std::min(alignDown(StackSize, 16), static_cast<uint64_t>(48));
+    uint64_t Spimm =
+        std::min(alignDown(StackSize, 16), static_cast<uint64_t>(48));
     FirstFrameSetup->getOperand(1).setImm(Spimm);
     StackSize -= Spimm;
 
@@ -874,7 +880,8 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
     }
 
     std::advance(MBBI, getRVVCalleeSavedInfo(MF, CSI).size());
-		emitCFIForCSI<CFISaveRVVRegisterEmitter>(MBB, MBBI, getRVVCalleeSavedInfo(MF, CSI));
+    emitCFIForCSI<CFISaveRVVRegisterEmitter>(MBB, MBBI,
+                                             getRVVCalleeSavedInfo(MF, CSI));
   }
 
   if (hasFP(MF)) {
@@ -1001,7 +1008,8 @@ void RISCVFrameLowering::emitEpilogue(MachineFunction &MF,
           .addCFIIndex(CFIIndex)
           .setMIFlag(MachineInstr::FrameDestroy);
     }
-		emitCFIForCSI<CFIRestoreRVVRegisterEmitter>(MBB, LastFrameDestroy, getRVVCalleeSavedInfo(MF, CSI));
+    emitCFIForCSI<CFIRestoreRVVRegisterEmitter>(MBB, LastFrameDestroy,
+                                                getRVVCalleeSavedInfo(MF, CSI));
   }
 
   if (FirstSPAdjustAmount) {
