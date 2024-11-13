@@ -27,64 +27,6 @@
 
 using namespace llvm;
 
-namespace {
-
-class CFISaveRegisterEmitter {
-  MachineFunction &m_MF;
-  MachineFrameInfo &m_MFI;
-
-public:
-  CFISaveRegisterEmitter(MachineFunction &MF)
-      : m_MF{MF}, m_MFI{MF.getFrameInfo()} {};
-
-  void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
-            const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
-            const DebugLoc &DL, const CalleeSavedInfo &CS) const {
-    int FrameIdx = CS.getFrameIdx();
-    int64_t Offset = m_MFI.getObjectOffset(FrameIdx);
-    Register Reg = CS.getReg();
-    unsigned CFIIndex = m_MF.addFrameInst(MCCFIInstruction::createOffset(
-        nullptr, RI.getDwarfRegNum(Reg, true), Offset));
-    BuildMI(MBB, MBBI, DL, TII.get(TargetOpcode::CFI_INSTRUCTION))
-        .addCFIIndex(CFIIndex)
-        .setMIFlag(MachineInstr::FrameSetup);
-  }
-};
-
-class CFIRestoreRegisterEmitter {
-  MachineFunction &m_MF;
-
-public:
-  CFIRestoreRegisterEmitter(MachineFunction &MF) : m_MF{MF} {};
-
-  void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
-            const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
-            const DebugLoc &DL, const CalleeSavedInfo &CS) const {
-    Register Reg = CS.getReg();
-    unsigned CFIIndex = m_MF.addFrameInst(
-        MCCFIInstruction::createRestore(nullptr, RI.getDwarfRegNum(Reg, true)));
-    BuildMI(MBB, MBBI, DL, TII.get(TargetOpcode::CFI_INSTRUCTION))
-        .addCFIIndex(CFIIndex)
-        .setMIFlag(MachineInstr::FrameDestroy);
-  }
-};
-
-} // namespace
-
-template <typename Emitter>
-void RISCVFrameLowering::emitCFIForCSI(
-    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
-    const SmallVector<CalleeSavedInfo, 8> &CSI) const {
-  MachineFunction *MF = MBB.getParent();
-  const RISCVRegisterInfo *RI = STI.getRegisterInfo();
-  const RISCVInstrInfo *TII = STI.getInstrInfo();
-  DebugLoc DL = MBB.findDebugLoc(MBBI);
-
-  Emitter E{*MF};
-  for (const auto &CS : CSI)
-    E.emit(MBB, MBBI, *RI, *TII, DL, CS);
-}
-
 static Align getABIStackAlignment(RISCVABI::ABI ABI) {
   if (ABI == RISCVABI::ABI_ILP32E)
     return Align(4);
@@ -602,6 +544,142 @@ static MCCFIInstruction createDefCFAOffset(const TargetRegisterInfo &TRI,
                                         Comment.str());
 }
 
+static unsigned getCalleeSavedRVVNumRegs(const Register &BaseReg) {
+  return RISCV::VRRegClass.contains(BaseReg)     ? 1
+         : RISCV::VRM2RegClass.contains(BaseReg) ? 2
+         : RISCV::VRM4RegClass.contains(BaseReg) ? 4
+                                                 : 8;
+}
+
+static MCRegister getRVVBaseRegister(const RISCVRegisterInfo &TRI,
+                                     const Register &Reg) {
+  MCRegister BaseReg = TRI.getSubReg(Reg, RISCV::sub_vrm1_0);
+  // If it's not a grouped vector register, it doesn't have subregister, so
+  // the base register is just itself.
+  if (BaseReg == RISCV::NoRegister)
+    BaseReg = Reg;
+  return BaseReg;
+}
+
+namespace {
+
+class CFISaveRegisterEmitter {
+  MachineFunction &m_MF;
+  MachineFrameInfo &m_MFI;
+
+public:
+  CFISaveRegisterEmitter(const RISCVFrameLowering &, MachineFunction &MF)
+      : m_MF{MF}, m_MFI{MF.getFrameInfo()} {};
+
+  void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+            const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
+            const DebugLoc &DL, const CalleeSavedInfo &CS) const {
+    int FrameIdx = CS.getFrameIdx();
+    int64_t Offset = m_MFI.getObjectOffset(FrameIdx);
+    Register Reg = CS.getReg();
+    unsigned CFIIndex = m_MF.addFrameInst(MCCFIInstruction::createOffset(
+        nullptr, RI.getDwarfRegNum(Reg, true), Offset));
+    BuildMI(MBB, MBBI, DL, TII.get(TargetOpcode::CFI_INSTRUCTION))
+        .addCFIIndex(CFIIndex)
+        .setMIFlag(MachineInstr::FrameSetup);
+  }
+};
+
+class CFIRestoreRegisterEmitter {
+  MachineFunction &m_MF;
+
+public:
+  CFIRestoreRegisterEmitter(const RISCVFrameLowering &, MachineFunction &MF) : m_MF{MF} {};
+
+  void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+            const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
+            const DebugLoc &DL, const CalleeSavedInfo &CS) const {
+    Register Reg = CS.getReg();
+    unsigned CFIIndex = m_MF.addFrameInst(
+        MCCFIInstruction::createRestore(nullptr, RI.getDwarfRegNum(Reg, true)));
+    BuildMI(MBB, MBBI, DL, TII.get(TargetOpcode::CFI_INSTRUCTION))
+        .addCFIIndex(CFIIndex)
+        .setMIFlag(MachineInstr::FrameDestroy);
+  }
+};
+
+class CFISaveRVVRegisterEmitter {
+  MachineFunction &m_MF;
+  MachineFrameInfo &m_MFI;
+	const uint64_t m_FixedSize;
+
+	static uint64_t getFixedSize(const RISCVFrameLowering &FL, MachineFunction &MF, MachineFrameInfo &MFI) {
+  	const auto *RVFI = MF.getInfo<RISCVMachineFunctionInfo>();
+		
+		uint64_t FixedSize = FL.getStackSizeWithRVVPadding(MF);
+		if (!FL.hasFP(MF)) {
+			uint64_t ScalarLocalVarSize =
+					MFI.getStackSize() - RVFI->getCalleeSavedStackSize() -
+					RVFI->getRVPushStackSize() - RVFI->getVarArgsSaveSize() +
+					RVFI->getRVVPadding();
+			FixedSize -= ScalarLocalVarSize;
+		}
+		return FixedSize;
+	}
+
+public:
+  CFISaveRVVRegisterEmitter(const RISCVFrameLowering &FL, MachineFunction &MF) : m_MF{MF}, m_MFI{MF.getFrameInfo()}, m_FixedSize{getFixedSize(FL, MF, m_MFI)} {};
+
+void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+					const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
+					const DebugLoc &DL, const CalleeSavedInfo &CS) const {
+
+  // Insert the spill to the stack frame.
+    int FI = CS.getFrameIdx();
+    MCRegister BaseReg = getRVVBaseRegister(RI, CS.getReg());
+    unsigned NumRegs = getCalleeSavedRVVNumRegs(CS.getReg());
+    for (unsigned i = 0; i < NumRegs; ++i) {
+      unsigned CFIIndex = m_MF.addFrameInst(createDefCFAOffset(
+          RI, BaseReg + i, -m_FixedSize, m_MFI.getObjectOffset(FI) / 8 + i));
+      BuildMI(MBB, MBBI, DL, TII.get(TargetOpcode::CFI_INSTRUCTION))
+          .addCFIIndex(CFIIndex)
+          .setMIFlag(MachineInstr::FrameSetup);
+    }
+  }
+};
+
+class CFIRestoreRVVRegisterEmitter {
+  MachineFunction &m_MF;
+
+public:
+  CFIRestoreRVVRegisterEmitter(const RISCVFrameLowering &, MachineFunction &MF) : m_MF{MF} {};
+
+void emit(MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+					const RISCVRegisterInfo &RI, const RISCVInstrInfo &TII,
+					const DebugLoc &DL, const CalleeSavedInfo &CS) const {
+    MCRegister BaseReg = getRVVBaseRegister(RI, CS.getReg());
+    unsigned NumRegs = getCalleeSavedRVVNumRegs(CS.getReg());
+    for (unsigned i = 0; i < NumRegs; ++i) {
+      unsigned CFIIndex = m_MF.addFrameInst(MCCFIInstruction::createRestore(
+          nullptr, RI.getDwarfRegNum(BaseReg + i, true)));
+      BuildMI(MBB, MBBI, DL, TII.get(TargetOpcode::CFI_INSTRUCTION))
+          .addCFIIndex(CFIIndex)
+          .setMIFlag(MachineInstr::FrameDestroy);
+    }
+  }
+};
+
+} // namespace
+
+template <typename Emitter>
+void RISCVFrameLowering::emitCFIForCSI(
+    MachineBasicBlock &MBB, MachineBasicBlock::iterator MBBI,
+    const SmallVector<CalleeSavedInfo, 8> &CSI) const {
+  MachineFunction *MF = MBB.getParent();
+  const RISCVRegisterInfo *RI = STI.getRegisterInfo();
+  const RISCVInstrInfo *TII = STI.getInstrInfo();
+  DebugLoc DL = MBB.findDebugLoc(MBBI);
+
+  Emitter E{*this, *MF};
+  for (const auto &CS : CSI)
+    E.emit(MBB, MBBI, *RI, *TII, DL, CS);
+}
+
 void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
                                       MachineBasicBlock &MBB) const {
   MachineFrameInfo &MFI = MF.getFrameInfo();
@@ -796,7 +874,7 @@ void RISCVFrameLowering::emitPrologue(MachineFunction &MF,
     }
 
     std::advance(MBBI, getRVVCalleeSavedInfo(MF, CSI).size());
-    emitCalleeSavedRVVPrologCFI(MBB, MBBI, hasFP(MF));
+		emitCFIForCSI<CFISaveRVVRegisterEmitter>(MBB, MBBI, getRVVCalleeSavedInfo(MF, CSI));
   }
 
   if (hasFP(MF)) {
@@ -923,8 +1001,7 @@ void RISCVFrameLowering::emitEpilogue(MachineFunction &MF,
           .addCFIIndex(CFIIndex)
           .setMIFlag(MachineInstr::FrameDestroy);
     }
-
-    emitCalleeSavedRVVEpilogCFI(MBB, LastFrameDestroy);
+		emitCFIForCSI<CFIRestoreRVVRegisterEmitter>(MBB, LastFrameDestroy, getRVVCalleeSavedInfo(MF, CSI));
   }
 
   if (FirstSPAdjustAmount) {
@@ -1710,83 +1787,6 @@ bool RISCVFrameLowering::spillCalleeSavedRegisters(
   storeRegToStackSlot(RVVCSI);
 
   return true;
-}
-
-static unsigned getCalleeSavedRVVNumRegs(const Register &BaseReg) {
-  return RISCV::VRRegClass.contains(BaseReg)     ? 1
-         : RISCV::VRM2RegClass.contains(BaseReg) ? 2
-         : RISCV::VRM4RegClass.contains(BaseReg) ? 4
-                                                 : 8;
-}
-
-static MCRegister getRVVBaseRegister(const RISCVRegisterInfo &TRI,
-                                     const Register &Reg) {
-  MCRegister BaseReg = TRI.getSubReg(Reg, RISCV::sub_vrm1_0);
-  // If it's not a grouped vector register, it doesn't have subregister, so
-  // the base register is just itself.
-  if (BaseReg == RISCV::NoRegister)
-    BaseReg = Reg;
-  return BaseReg;
-}
-
-void RISCVFrameLowering::emitCalleeSavedRVVPrologCFI(
-    MachineBasicBlock &MBB, MachineBasicBlock::iterator MI, bool HasFP) const {
-  MachineFunction *MF = MBB.getParent();
-  const MachineFrameInfo &MFI = MF->getFrameInfo();
-  RISCVMachineFunctionInfo *RVFI = MF->getInfo<RISCVMachineFunctionInfo>();
-  const TargetInstrInfo &TII = *STI.getInstrInfo();
-  const RISCVRegisterInfo &TRI = *STI.getRegisterInfo();
-  DebugLoc DL = MBB.findDebugLoc(MI);
-
-  const auto &RVVCSI = getRVVCalleeSavedInfo(*MF, MFI.getCalleeSavedInfo());
-  if (RVVCSI.empty())
-    return;
-
-  uint64_t FixedSize = getStackSizeWithRVVPadding(*MF);
-  if (!HasFP) {
-    uint64_t ScalarLocalVarSize =
-        MFI.getStackSize() - RVFI->getCalleeSavedStackSize() -
-        RVFI->getRVPushStackSize() - RVFI->getVarArgsSaveSize() +
-        RVFI->getRVVPadding();
-    FixedSize -= ScalarLocalVarSize;
-  }
-
-  for (auto &CS : RVVCSI) {
-    // Insert the spill to the stack frame.
-    int FI = CS.getFrameIdx();
-    MCRegister BaseReg = getRVVBaseRegister(TRI, CS.getReg());
-    unsigned NumRegs = getCalleeSavedRVVNumRegs(CS.getReg());
-    for (unsigned i = 0; i < NumRegs; ++i) {
-      unsigned CFIIndex = MF->addFrameInst(createDefCFAOffset(
-          TRI, BaseReg + i, -FixedSize, MFI.getObjectOffset(FI) / 8 + i));
-      BuildMI(MBB, MI, DL, TII.get(TargetOpcode::CFI_INSTRUCTION))
-          .addCFIIndex(CFIIndex)
-          .setMIFlag(MachineInstr::FrameSetup);
-    }
-  }
-}
-
-void RISCVFrameLowering::emitCalleeSavedRVVEpilogCFI(
-    MachineBasicBlock &MBB, MachineBasicBlock::iterator MI) const {
-  MachineFunction *MF = MBB.getParent();
-  const MachineFrameInfo &MFI = MF->getFrameInfo();
-  const RISCVRegisterInfo *RI = STI.getRegisterInfo();
-  const TargetInstrInfo &TII = *STI.getInstrInfo();
-  const RISCVRegisterInfo &TRI = *STI.getRegisterInfo();
-  DebugLoc DL = MBB.findDebugLoc(MI);
-
-  const auto &RVVCSI = getRVVCalleeSavedInfo(*MF, MFI.getCalleeSavedInfo());
-  for (auto &CS : RVVCSI) {
-    MCRegister BaseReg = getRVVBaseRegister(TRI, CS.getReg());
-    unsigned NumRegs = getCalleeSavedRVVNumRegs(CS.getReg());
-    for (unsigned i = 0; i < NumRegs; ++i) {
-      unsigned CFIIndex = MF->addFrameInst(MCCFIInstruction::createRestore(
-          nullptr, RI->getDwarfRegNum(BaseReg + i, true)));
-      BuildMI(MBB, MI, DL, TII.get(TargetOpcode::CFI_INSTRUCTION))
-          .addCFIIndex(CFIIndex)
-          .setMIFlag(MachineInstr::FrameDestroy);
-    }
-  }
 }
 
 bool RISCVFrameLowering::restoreCalleeSavedRegisters(
